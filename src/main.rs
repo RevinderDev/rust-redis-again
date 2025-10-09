@@ -1,70 +1,88 @@
 #![allow(unused_imports)]
+use bytes::{Buf, BytesMut};
+use commands::Command;
+use parser::{ParserError, RespValue};
 use std::{
-    io::{BufRead, BufReader, Read, Write},
-    net::{TcpListener, TcpStream},
+    borrow::BorrowMut,
+    io::{BufRead, BufReader, Read, Result, Write},
     str, thread,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
-fn handle_connection(mut stream: TcpStream) {
-    println!("New thread started for a connection.");
-    let mut reader = BufReader::new(&mut stream);
-    let mut buffer = String::new();
+mod commands;
+mod parser;
+
+async fn process(mut socket: TcpStream) {
+    tokio::spawn(async move {
+        let mut buffer = BytesMut::with_capacity(4096);
+
+        loop {
+            loop {
+                println!("Current buffer: {buffer:#?}");
+                let response = match RespValue::parse(&buffer) {
+                    Ok((value, consumed)) => {
+                        let command_result = Command::from_resp(value);
+
+                        let response = match command_result {
+                            Ok(command) => command.execute(),
+                            Err(e) => format!("-ERR {}\r\n", e).into_bytes(),
+                        };
+                        buffer.advance(consumed);
+                        response
+                    }
+                    Err(ParserError::Incomplete) => break,
+                    Err(ParserError::InvalidFormat(e)) => {
+                        let _ = socket.write_all(format!("-ERR {}\r\n", e).as_bytes()).await;
+                        // NOTE: Do you want to close connection here?
+                        return;
+                    }
+                };
+
+                if let Err(e) = socket.write_all(&response).await {
+                    eprintln!("failed to write response: {:?}", e);
+                    return;
+                }
+            }
+
+            match socket.read_buf(&mut buffer).await {
+                Ok(0) => {
+                    println!("Client closed connection");
+                    return;
+                }
+                Ok(n) => {
+                    println!("Read {} bytes from socket", n);
+                }
+                Err(e) => {
+                    eprintln!("failed to read from socket; err = {:?}", e);
+                    return;
+                }
+            }
+        }
+    });
+}
+
+async fn server_loop() {
+    let listener = match TcpListener::bind("127.0.0.1:6379").await {
+        Ok(s) => s,
+        Err(e) => {
+            println!("Error unable to start the server: {e}");
+            return;
+        }
+    };
 
     loop {
-        buffer.clear();
-
-        let _bytes_read = match reader.read_line(&mut buffer) {
-            Ok(0) => {
-                println!("Client disconnected.");
-                return; // Exit the function, which ends the thread
+        match listener.accept().await {
+            Ok((socket, _)) => {
+                process(socket).await;
             }
-            Ok(n) => n,
-            Err(e) => {
-                println!("Failed to read from stream: {}", e);
-                return;
-            }
+            Err(e) => eprintln!("Failed to establish connectin: {:?}", e),
         };
-
-        println!("Received: {}", buffer);
-        if buffer.trim().to_uppercase().starts_with("PING") {
-            let stream_writer = reader.get_mut();
-            stream_writer.write_all(b"+PONG\r\n").unwrap();
-        }
     }
 }
 
-fn main() {
-    println!("Logs from your program will appear here!");
-    let listener = TcpListener::bind("127.0.0.1:6379").unwrap();
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut _stream) => {
-                thread::spawn(move || {
-                    handle_connection(_stream);
-                });
-                // println!("accepted new connection");
-                // let mut reader = BufReader::new(&mut _stream);
-                // let mut buffer = String::new();
-                //
-                // loop {
-                //     buffer.clear();
-                //     let bytes_read = reader.read_line(&mut buffer).unwrap();
-                //     if bytes_read == 0 {
-                //         println!("client disconnected");
-                //         break;
-                //     }
-                //     println!("Read the buffer: {}", buffer.trim());
-                //     if buffer.contains("PING") {
-                //         let stream_writer = reader.get_mut();
-                //         stream_writer.write_all(b"+PONG\r\n").unwrap();
-                //         println!("Responded with PONG");
-                //         break;
-                //     }
-                // }
-            }
-            Err(e) => {
-                println!("error: {}", e);
-            }
-        }
-    }
+#[tokio::main]
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    server_loop().await;
+    Ok(())
 }
