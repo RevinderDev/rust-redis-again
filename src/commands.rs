@@ -1,11 +1,13 @@
 use std::fmt;
 
+use crate::db::Database;
 use crate::parser::RespValue;
 
 #[derive(Debug)]
 pub enum Command {
     Ping(Option<Vec<u8>>),
     Echo(Vec<u8>),
+    Set { key: Vec<u8>, value: Vec<u8> },
 }
 
 #[derive(Debug)]
@@ -87,15 +89,41 @@ impl Command {
                     })
                 }
             }
+            "SET" => {
+                if args.len() != 2 {
+                    return Err(CommandError::WrongArgCount {
+                        command: "SET".to_string(),
+                        expected: "2".to_string(),
+                    });
+                }
+                match (&args[0], &args[1]) {
+                    (RespValue::BulkString(key), RespValue::BulkString(value)) => {
+                        Ok(Command::Set {
+                            key: key.clone(),
+                            value: value.clone(),
+                        })
+                    }
+                    _ => Err(CommandError::InvalidArgument {
+                        command: "SET".to_string(),
+                        reason: "key and value must be bulk strings".to_string(),
+                    }),
+                }
+            }
             _ => Err(CommandError::UnknownCommand(cmd_name)),
         }
     }
 
-    pub fn execute(&self) -> Vec<u8> {
+    pub fn execute(&self, db: &Database) -> Vec<u8> {
         match self {
             Command::Ping(None) => b"+PONG\r\n".to_vec(),
             Command::Ping(Some(msg)) | Command::Echo(msg) => {
-                format!("${}\r\n{}\r\n", msg.len(), String::from_utf8_lossy(&msg)).into_bytes()
+                format!("${}\r\n{}\r\n", msg.len(), String::from_utf8_lossy(msg)).into_bytes()
+            }
+            Command::Set { key, value } => {
+                let mut db_lock = db.lock().unwrap();
+                let key_string = String::from_utf8_lossy(key).to_string();
+                db_lock.insert(key_string, value.to_vec());
+                b"+OK\r\n".to_vec()
             }
         }
     }
@@ -150,17 +178,3 @@ mod tests {
         echo_test(RespValue::BulkString(b"echo".to_vec()));
     }
 }
-
-// pub fn process_value_into_command(resp: RespValue) {
-//     match resp {
-//         RespValue::SimpleString(_) => todo!(),
-//         RespValue::Integer(_) => todo!(),
-//         RespValue::BulkString(bytes) => handle_command(),
-//         RespValue::Array(elements) => {
-//             for element in elements {
-//                 process_value_into_command(element);
-//             }
-//         }
-//         RespValue::Null => todo!(),
-//     }
-// }
