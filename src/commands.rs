@@ -8,6 +8,7 @@ pub enum Command {
     Ping(Option<Vec<u8>>),
     Echo(Vec<u8>),
     Set { key: Vec<u8>, value: Vec<u8> },
+    Get { key: Vec<u8> },
 }
 
 #[derive(Debug)]
@@ -109,6 +110,22 @@ impl Command {
                     }),
                 }
             }
+            "GET" => {
+                if args.len() != 1 {
+                    return Err(CommandError::WrongArgCount {
+                        command: "GET".to_string(),
+                        expected: "1".to_string(),
+                    });
+                }
+                if let Some(RespValue::BulkString(key)) = args.first() {
+                    Ok(Command::Get { key: key.clone() })
+                } else {
+                    Err(CommandError::InvalidArgument {
+                        command: "GET".to_string(),
+                        reason: "argument must be a bulk string".to_string(),
+                    })
+                }
+            }
             _ => Err(CommandError::UnknownCommand(cmd_name)),
         }
     }
@@ -125,23 +142,91 @@ impl Command {
                 db_lock.insert(key_string, value.to_vec());
                 b"+OK\r\n".to_vec()
             }
+            Command::Get { key } => {
+                let db_lock = db.lock().unwrap();
+                let key_string = String::from_utf8_lossy(key).to_string();
+                match db_lock.get(&key_string) {
+                    Some(value) => {
+                        let string_value = String::from_utf8_lossy(value).to_string();
+                        format!("${}\r\n{}\r\n", string_value.len(), string_value).into_bytes()
+                    }
+                    None => b"$-1\r\n".to_vec(),
+                }
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
     use crate::commands::{Command, CommandError};
+    use crate::db::Database;
     use crate::parser::RespValue;
+
+    #[test]
+    fn test_set_get() {
+        // Given
+        let value = b"hello world value";
+        let db: Database = Arc::new(Mutex::new(HashMap::new()));
+        let resp_value = RespValue::Array(vec![
+            RespValue::BulkString(b"SET".to_vec()),
+            RespValue::BulkString(b"key".to_vec()),
+            RespValue::BulkString(value.to_vec()),
+        ]);
+
+        // Act
+        let command = Command::from_resp(resp_value).unwrap();
+        let response = command.execute(&db);
+
+        // Assert
+        assert_eq!(response, b"+OK\r\n");
+
+        // Given Part II
+        let resp_value = RespValue::Array(vec![
+            RespValue::BulkString(b"GET".to_vec()),
+            RespValue::BulkString(b"key".to_vec()),
+        ]);
+
+        // Act Part II
+        let command = Command::from_resp(resp_value).unwrap();
+        let response = command.execute(&db);
+
+        let expected_response =
+            format!("${}\r\n{}\r\n", value.len(), String::from_utf8_lossy(value));
+
+        // Assert Part II
+        assert_eq!(response, expected_response.into_bytes());
+    }
+
+    #[test]
+    fn test_get_missing_key() {
+        // Given
+        let db: Database = Arc::new(Mutex::new(HashMap::new()));
+        let resp_value = RespValue::Array(vec![
+            RespValue::BulkString(b"GET".to_vec()),
+            RespValue::BulkString(b"key".to_vec()),
+        ]);
+
+        // Act
+        let command = Command::from_resp(resp_value).unwrap();
+        let response = command.execute(&db);
+
+        // Assert
+        assert_eq!(response, b"$-1\r\n");
+    }
 
     #[test]
     fn test_ping_command() {
         // Given
+        let db: Database = Arc::new(Mutex::new(HashMap::new()));
         let resp_value = RespValue::Array(vec![RespValue::BulkString(b"PING".to_vec())]);
 
         // Act
         let command = Command::from_resp(resp_value).unwrap();
-        let response = command.execute();
+        let response = command.execute(&db);
 
         // Assert
         assert_eq!(response, b"+PONG\r\n");
@@ -151,11 +236,12 @@ mod tests {
         // Echo can be echoed with PING or ECHO commands
         // Given
         let argument = b"hello";
+        let db: Database = Arc::new(Mutex::new(HashMap::new()));
         let resp_value = RespValue::Array(vec![resp, RespValue::BulkString(argument.to_vec())]);
 
         // Act
         let command = Command::from_resp(resp_value).unwrap();
-        let response = command.execute();
+        let response = command.execute(&db);
 
         // Assert
         let expected_response = format!(
